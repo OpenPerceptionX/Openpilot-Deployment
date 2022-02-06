@@ -15,7 +15,7 @@ if ! $(apt list --installed | grep -q nvidia-container-toolkit); then
   fi
 fi
 
-docker pull carlasim/carla:0.9.12
+# docker pull carlasim/carla:0.9.12
 
 docker run \
   --rm \
