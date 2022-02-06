@@ -6,14 +6,17 @@ cd $DIR
 # expose X to the container
 xhost +local:root
 
-docker pull ghcr.io/commaai/openpilot-sim:latest
 
-OPENPILOT_DIR="/openpilot"
-if ! [[ -z "$MOUNT_OPENPILOT" ]]
-then
-  OPENPILOT_DIR="$(dirname $(dirname $DIR))"
-  EXTRA_ARGS="-v $OPENPILOT_DIR:$OPENPILOT_DIR -e PYTHONPATH=$OPENPILOT_DIR:$PYTHONPATH"
-fi
+# docker pull ghcr.io/commaai/openpilot-sim:latest
+
+OPENPILOT_DIR="/openpilot_two_models"
+# if ! [[ -z "$MOUNT_OPENPILOT" ]]
+# then
+#   OPENPILOT_DIR="$(dirname $(dirname $DIR))"
+#   EXTRA_ARGS="-v $OPENPILOT_DIR:$OPENPILOT_DIR -e PYTHONPATH=$OPENPILOT_DIR:$PYTHONPATH"
+# fi
+# ####
+EXTRA_ARGS="-v /home/SENSETIME/caizhitian.vendor/Work/openpilot_two_models:/openpilot_two_models"
 
 docker run --net=host\
   --name openpilot_client \
@@ -26,7 +29,7 @@ docker run --net=host\
   --shm-size 1G \
   -e DISPLAY=$DISPLAY \
   -e QT_X11_NO_MITSHM=1 \
-  -w "$OPENPILOT_DIR/tools/sim" \
+  -w "$OPENPILOT_DIR" \
   $EXTRA_ARGS \
   ghcr.io/commaai/openpilot-sim:latest \
-  /bin/bash -c "./tmux_script.sh $*"
+  # /bin/bash -c "./tmux_script.sh $*"
