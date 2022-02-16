@@ -2,6 +2,7 @@
 
 import os
 import sys
+import select
 import numpy as np
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -15,7 +16,12 @@ def read(sz):
   dd = []
   gt = 0
   global pipein 
+  read_pollers = select.poll()
+  read_pollers.register(pipein, select.POLLIN)
+  
   while gt < sz * 4:
+    err = read_pollers.poll(1000)
+    assert(len(err) > 0)
     st = os.read(pipein, sz * 4 - gt)
     assert(len(st) > 0)
     dd.append(st)
