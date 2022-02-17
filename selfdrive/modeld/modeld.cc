@@ -15,13 +15,14 @@
 #include "selfdrive/common/util.h"
 #include "selfdrive/hardware/hw.h"
 #include "selfdrive/modeld/models/driving.h"
-
+#include "inttypes.h"
 ExitHandler do_exit;
 
 #define DROPED_FRAME_OUT_LOG
 
 std::mutex plan_mutex;
 ModelOutput* model_output_extra = NULL;
+struct ModelOutputPlanPrediction best_plan_extra;
 
 mat3 update_calibration(cereal::LiveCalibrationData::Reader live_calib, bool wide_camera) {
   /*
@@ -75,8 +76,10 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
+    FILE* plan_log_fd;
     onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/onnx_log.txt","w");
-    if(onnx_log_fd == NULL)
+    plan_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/origin_plan_log.txt","w");
+    if(onnx_log_fd == NULL || plan_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
     }
@@ -117,13 +120,18 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
 
     float frame_drop_ratio = frames_dropped / (1 + frames_dropped);
     
+    // msg save
+
     model_publish(pm, extra.frame_id, frame_id, frame_drop_ratio, *model_output, extra.timestamp_eof, model_execution_time,
                   kj::ArrayPtr<const float>(model.output.data(), model.output.size()), live_calib_seen);
     posenet_publish(pm, extra.frame_id, vipc_dropped_frames, *model_output, extra.timestamp_eof, live_calib_seen);
 
+    const uint32_t frame_age = (frame_id > extra.frame_id) ? (frame_id -  extra.frame_id) : 0;
     #ifdef DROPED_FRAME_OUT_LOG
-      fprintf(onnx_log_fd, "model process: %.2fms, from last %.2fms, vipc_frame_id %u, frame_id, %u, frame_drop %.3f\n", \
+      fprintf(onnx_log_fd, "model process: %.2fms from last %.2fms  vipc_frame_id %u  frame_id, %u  frame_drop %.3f\n", \
               mt2 - mt1, mt1 - last, extra.frame_id, frame_id, frame_drop_ratio);
+      fprintf(plan_log_fd, "vipc_frame_id:  %u, cur_frame_id: %u, vipc_timestamp: %lld, model_excute_time:  %.3f,frame_age: %u\n",\
+        extra.frame_id, frame_id, (long long)extra.timestamp_eof, model_execution_time,frame_age);
     #endif 
 
     last = mt1;
@@ -152,8 +160,10 @@ void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
+    FILE* plan_log_fd;
     onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/extra_onnx_log.txt","w");
-    if(onnx_log_fd == NULL)
+    plan_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/extra_plan_log.txt","w");
+    if(onnx_log_fd == NULL || plan_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
     }
@@ -183,8 +193,16 @@ void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_
     double mt2 = millis_since_boot();
 
     {
-       std::lock_guard<std::mutex> plan_lock(plan_mutex);
-       model_output_extra = model_output;
+        std::lock_guard<std::mutex> plan_lock(plan_mutex);
+        model_output_extra = model_output;
+        // int max_idx = 0;
+        // for (int i = 1; i < model_output->plans.prediction.size(); i++) {
+        //   if (model_output->plans.prediction[i].prob > model_output->plans.prediction[max_idx].prob) {
+        //     max_idx = i;
+        //   }
+        // }
+        // best_plan_extra = model_output->plans.prediction[max_idx];
+
     }
     float model_execution_time = (mt2 - mt1) / 1000.0;
 
@@ -203,9 +221,12 @@ void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_
     //               kj::ArrayPtr<const float>(model.output.data(), model.output.size()), live_calib_seen);
     // posenet_publish(pm, extra.frame_id, vipc_dropped_frames, *model_output, extra.timestamp_eof, live_calib_seen);
 
+    const uint32_t frame_age = (frame_id > extra.frame_id) ? (frame_id -  extra.frame_id) : 0;
     #ifdef DROPED_FRAME_OUT_LOG
       fprintf(onnx_log_fd, "model process: %.2fms, from last %.2fms, vipc_frame_id %u, frame_id, %u, frame_drop %.3f\n", \
               mt2 - mt1, mt1 - last, extra.frame_id, frame_id, frame_drop_ratio);
+      fprintf(plan_log_fd, "vipc_frame_id:  %u  cur_frame_id: %u  vipc_timestamp: %lld  model_excute_time:  %.3f  frame_age:  %u\n",\
+        extra.frame_id, frame_id, (long long)extra.timestamp_eof, model_execution_time,frame_age);
     #endif 
 
     last = mt1;
@@ -235,7 +256,7 @@ void run_two_onnx_model(ModelState &model, ModelState &model_extra,VisionIpcClie
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
-    onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/onnx_log.txt","w");
+    onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/two_onnx_log.txt","w");
     if(onnx_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
@@ -320,12 +341,13 @@ int main(int argc, char **argv)
   ModelState model;
   ModelState model_extra;
 
-  // this init order corresbond to thread running
+  // two model init process need about 310ms
   model_init_extra(&model_extra, device_id, context);
   model_init(&model, device_id, context);
-
-  LOGW("Two models loaded, modeld starting");
-
+   //delay 400ms,wait for two process  running
+  usleep(1000 * 400);
+  LOGW("Two models process started, modeld starting");
+ 
   VisionIpcClient vipc_client = VisionIpcClient("camerad",\
                     wide_camera ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD, true, device_id, context);
 
@@ -340,8 +362,10 @@ int main(int argc, char **argv)
     LOGW("connected with buffer size: %d (%d x %d)", b->len, b->width, b->height);
    
     std::vector<std::thread> threads;
-    threads.push_back(std::thread(run_model,std::ref(model),std::ref(vipc_client),wide_camera));
     threads.push_back(std::thread(run_model_extra,std::ref(model_extra),std::ref(vipc_client),wide_camera));
+    //ensure that old model runs later than the new
+    usleep(1000 * 100);
+    threads.push_back(std::thread(run_model,std::ref(model),std::ref(vipc_client),wide_camera));
     
     for(auto& t : threads)
     {
