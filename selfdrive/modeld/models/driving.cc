@@ -22,6 +22,8 @@ std::array<float, 3> prev_brake_3ms2_probs = {0,0,0};
 
 extern std::mutex plan_mutex;
 extern ModelOutput* model_output_extra;
+extern FILE* origin_best_plan_fd;
+extern FILE* extra_best_plan_fd;
 
 template<class T, size_t size>
 constexpr const kj::ArrayPtr<const T> to_kj_array_ptr(const std::array<T, size> &arr) {
@@ -151,7 +153,7 @@ void fill_lead(cereal::ModelDataV2::LeadDataV3::Builder lead, const ModelOutputL
   lead.setA(to_kj_array_ptr(lead_a));
   lead.setXStd(to_kj_array_ptr(lead_x_std));
   lead.setYStd(to_kj_array_ptr(lead_y_std));
-  lead.setVStd(to_kj_array_ptr(lead_v_std));
+  lead.setVStd(to_kj_array_ptr(lead_v_std));    
   lead.setAStd(to_kj_array_ptr(lead_a_std));
 }
 
@@ -317,14 +319,24 @@ void fill_road_edges(cereal::ModelDataV2::Builder &framed, const std::array<floa
 }
 
 
-void fill_model(cereal::ModelDataV2::Builder &framed, const ModelOutput &net_outputs) {
+void fill_model(cereal::ModelDataV2::Builder &framed, uint64_t timestamp_eof, const ModelOutput &net_outputs) {
 
-  //const auto &best_plan = net_outputs.plans.get_best_prediction();
+  const auto &best_plan_origin = net_outputs.plans.get_best_prediction();
   struct ModelOutputPlanPrediction best_plan;
   
   {
       std::lock_guard<std::mutex> plan_lock(plan_mutex);
       best_plan = model_output_extra->plans.get_best_prediction();
+  }
+
+  // output best plan to files
+  for(int i=0; i<TRAJECTORY_SIZE; i++) {
+  fprintf(origin_best_plan_fd,"%lu,%.2f,%.2f,%.2f\n",\
+          timestamp_eof, best_plan_origin.mean[i].position.x, best_plan_origin.mean[i].position.y, \
+          best_plan_origin.mean[i].position.z);
+    fprintf(extra_best_plan_fd,"%lu,%.2f,%.2f,%.2f\n",\
+            timestamp_eof, best_plan.mean[i].position.x, best_plan.mean[i].position.y, \
+            best_plan.mean[i].position.z);
   }
 
   std::array<float, TRAJECTORY_SIZE> plan_t;
@@ -377,7 +389,7 @@ void model_publish(PubMaster &pm, uint32_t vipc_frame_id, uint32_t frame_id, flo
   if (send_raw_pred) {
     framed.setRawPredictions(raw_pred.asBytes());
   }
-  fill_model(framed, net_outputs);
+  fill_model(framed, timestamp_eof, net_outputs);
 
   pm.send("modelV2", msg);
 
