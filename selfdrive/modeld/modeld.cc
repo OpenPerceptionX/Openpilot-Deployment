@@ -26,8 +26,10 @@ struct ModelOutputPlanPrediction best_plan_extra;
 FILE* origin_best_plan_fd = NULL;
 FILE* extra_best_plan_fd = NULL;
 
-char extra_best_plan_path[] = "/openpilot/selfdrive/modeld/log_msg/extra_plan_log.txt";
-char origin_best_plan_path[] = "/openpilot/selfdrive/modeld/log_msg/origin_plan_log.txt";
+char extra_best_plan_path[] = "/data/openpilot/selfdrive/modeld/log_msg/extra_plan_log.txt";
+char origin_best_plan_path[] = "/data/openpilot/selfdrive/modeld/log_msg/origin_plan_log.txt";
+char extra_model_log_path[] = "/data/openpilot/selfdrive/modeld/log_msg/extra_model_log.txt";
+char origin_model_log_path[] = "/data/openpilot/selfdrive/modeld/log_msg/origin_model_log.txt";
 
 mat3 update_calibration(cereal::LiveCalibrationData::Reader live_calib, bool wide_camera) {
   /*
@@ -81,7 +83,7 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
-    onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/origin_model_log.txt","w");
+    onnx_log_fd = fopen(origin_model_log_path,"w");
     if(onnx_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
@@ -161,7 +163,7 @@ void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
-    onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/extra_model_log.txt","w");
+    onnx_log_fd = fopen(extra_model_log_path,"w");
     if(onnx_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
