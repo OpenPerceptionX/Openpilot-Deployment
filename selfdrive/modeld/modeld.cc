@@ -15,12 +15,21 @@
 #include "selfdrive/common/util.h"
 #include "selfdrive/hardware/hw.h"
 #include "selfdrive/modeld/models/driving.h"
-
+#include <cinttypes>
 ExitHandler do_exit;
 
- #define DROPED_FRAME_OUT_LOG
+#define DROPED_FRAME_OUT_LOG
 
-ModelOutput *extra_model_output = NULL;
+std::mutex plan_mutex;
+ModelOutput* model_output_extra = NULL;
+struct ModelOutputPlanPrediction best_plan_extra;
+FILE* origin_best_plan_fd = NULL;
+FILE* extra_best_plan_fd = NULL;
+
+char extra_best_plan_path[] = "/data/openpilot/selfdrive/modeld/log_msg/extra_plan_log.txt";
+char origin_best_plan_path[] = "/data/openpilot/selfdrive/modeld/log_msg/origin_plan_log.txt";
+char extra_model_log_path[] = "/data/openpilot/selfdrive/modeld/log_msg/extra_model_log.txt";
+char origin_model_log_path[] = "/data/openpilot/selfdrive/modeld/log_msg/origin_model_log.txt";
 
 mat3 update_calibration(cereal::LiveCalibrationData::Reader live_calib, bool wide_camera) {
   /*
@@ -74,7 +83,87 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
 
   #ifdef DROPED_FRAME_OUT_LOG
     FILE* onnx_log_fd;
-    onnx_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/onnx_log.txt","w");
+    onnx_log_fd = fopen(origin_model_log_path,"w");
+    if(onnx_log_fd == NULL)
+    {
+        printf("log_fd cannot open...\n");
+    }
+  #endif
+  do{
+    VisionIpcBufExtra extra = {};
+    VisionBuf *buf = vipc_client.recv(&extra);
+    if (buf == nullptr) continue;
+ 
+    // TODO: path planner timeout?
+    sm.update(0);
+    int desire = ((int)sm["lateralPlan"].getLateralPlan().getDesire());
+    frame_id = sm["roadCameraState"].getRoadCameraState().getFrameId();
+    if (sm.updated("liveCalibration")) {
+      model_transform = update_calibration(sm["liveCalibration"].getLiveCalibration(), wide_camera);
+      live_calib_seen = true;
+    }
+    
+    float vec_desire[DESIRE_LEN] = {0};
+    if (desire >= 0 && desire < DESIRE_LEN) {
+      vec_desire[desire] = 1.0;
+    }
+
+    double mt1 = millis_since_boot();
+    ModelOutput *model_output = model_eval_frame(&model, buf->buf_cl, buf->width, buf->height,
+                                              model_transform, vec_desire);
+    double mt2 = millis_since_boot();
+
+    float model_execution_time = (mt2 - mt1) / 1000.0;
+    // tracked dropped frames
+    uint32_t vipc_dropped_frames = extra.frame_id - last_vipc_frame_id - 1;
+    float frames_dropped = frame_dropped_filter.update((float)std::min(vipc_dropped_frames, 10U));
+    if (run_count < 10) { // let frame drops warm up
+      frame_dropped_filter.reset(0);
+      frames_dropped = 0.;
+    }
+    run_count++;
+
+    float frame_drop_ratio = frames_dropped / (1 + frames_dropped);
+    
+    // msg save
+
+    model_publish(pm, extra.frame_id, frame_id, frame_drop_ratio, *model_output, extra.timestamp_eof, model_execution_time,
+                  kj::ArrayPtr<const float>(model.output.data(), model.output.size()), live_calib_seen);
+    posenet_publish(pm, extra.frame_id, vipc_dropped_frames, *model_output, extra.timestamp_eof, live_calib_seen);
+
+    const uint32_t frame_age = (frame_id > extra.frame_id) ? (frame_id -  extra.frame_id) : 0;
+    #ifdef DROPED_FRAME_OUT_LOG
+      fprintf(onnx_log_fd, "model process: %.2fms vipc_timestamp: %lu vipc_frame_id %u  frame_id, %u  frame_drop %.3f  frame_age:  %u\n", \
+              mt2 - mt1,extra.timestamp_eof, extra.frame_id, frame_id, frame_drop_ratio, frame_age);
+    #endif 
+
+    last = mt1;
+    last_vipc_frame_id = extra.frame_id;
+  }while(!do_exit);//do_exit
+
+  #ifdef DROPED_FRAME_OUT_LOG
+    fclose(onnx_log_fd);
+  #endif
+}
+
+void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera) {
+  // messaging
+  PubMaster pm({"modelV2", "cameraOdometry"});
+  SubMaster sm({"lateralPlan", "roadCameraState", "liveCalibration"});
+
+  // setup filter to track dropped frames
+  FirstOrderFilter frame_dropped_filter(0., 10., 1. / MODEL_FREQ);
+
+  uint32_t frame_id = 0, last_vipc_frame_id = 0;
+  double last = 0;
+  uint32_t run_count = 0;
+
+  mat3 model_transform = {};
+  bool live_calib_seen = false;
+
+  #ifdef DROPED_FRAME_OUT_LOG
+    FILE* onnx_log_fd;
+    onnx_log_fd = fopen(extra_model_log_path,"w");
     if(onnx_log_fd == NULL)
     {
         printf("log_fd cannot open...\n");
@@ -94,6 +183,21 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
       live_calib_seen = true;
     }
 
+    // this will cause communication crashed
+    // if(sm.updated("modelV2"))
+    // {
+    //     auto position = sm["modelV2"].getModelV2().getPosition();
+    //     auto arr_x = position.getX();
+    //     auto arr_y = position.getX();
+    //     auto timestamp = sm["modelV2"].getModelV2().getTimestampEof();
+    //     for(int i=0; i<TRAJECTORY_SIZE; i++) {
+    //       fprintf(origin_best_plan_fd,"%lu,%.2f,%.2f\n",\
+    //               timestamp, arr_x[i], arr_y[i]);
+    //     }
+
+    // } 
+
+
     float vec_desire[DESIRE_LEN] = {0};
     if (desire >= 0 && desire < DESIRE_LEN) {
       vec_desire[desire] = 1.0;
@@ -102,9 +206,12 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
     double mt1 = millis_since_boot();
     ModelOutput *model_output = model_eval_frame(&model, buf->buf_cl, buf->width, buf->height,
                                               model_transform, vec_desire);
-    
-
     double mt2 = millis_since_boot();
+
+    {
+        std::lock_guard<std::mutex> plan_lock(plan_mutex);
+        model_output_extra = model_output;
+    }
     float model_execution_time = (mt2 - mt1) / 1000.0;
 
     // tracked dropped frames
@@ -118,13 +225,10 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
 
     float frame_drop_ratio = frames_dropped / (1 + frames_dropped);
 
-    model_publish(pm, extra.frame_id, frame_id, frame_drop_ratio, *model_output, extra.timestamp_eof, model_execution_time,
-                  kj::ArrayPtr<const float>(model.output.data(), model.output.size()), live_calib_seen);
-    posenet_publish(pm, extra.frame_id, vipc_dropped_frames, *model_output, extra.timestamp_eof, live_calib_seen);
-
+    const uint32_t frame_age = (frame_id > extra.frame_id) ? (frame_id -  extra.frame_id) : 0;
     #ifdef DROPED_FRAME_OUT_LOG
-      fprintf(onnx_log_fd, "model process: %.2fms, from last %.2fms, vipc_frame_id %u, frame_id, %u, frame_drop %.3f\n", \
-              mt2 - mt1, mt1 - last, extra.frame_id, frame_id, frame_drop_ratio);
+      fprintf(onnx_log_fd, "model process: %.2fms vipc_timestamp: %lu  vipc_frame_id %u  frame_id, %u  frame_drop %.3f  frame_age:  %u\n", \
+              mt2 - mt1,extra.timestamp_eof, extra.frame_id, frame_id, frame_drop_ratio, frame_age);
     #endif 
 
     last = mt1;
@@ -135,85 +239,6 @@ void run_model(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera
     fclose(onnx_log_fd);
   #endif
 }
-
-void run_model_extra(ModelState &model, VisionIpcClient &vipc_client, bool wide_camera) {
-  
-  //PubMaster pm({"modelV2", "cameraOdometry"});
-  SubMaster sm({"lateralPlan", "roadCameraState", "liveCalibration"});
-
-  // setup filter to track dropped frames
-  FirstOrderFilter frame_dropped_filter(0., 10., 1. / MODEL_FREQ);
-
-  uint32_t frame_id = 0, last_vipc_frame_id = 0;
-  double last = 0;
-  uint32_t run_count = 0;
-
-  mat3 model_transform = {};
-  bool live_calib_seen = false;
-
-  #ifdef DROPED_FRAME_OUT_LOG
-    FILE* extra_log_fd;
-    extra_log_fd = fopen("/openpilot/selfdrive/modeld/log_msg/extra_onnx_log.txt","w");
-    if(extra_log_fd == NULL)
-    {
-      printf("extra_log cannot open...\n");
-    }
-  #endif
-  do{
-    VisionIpcBufExtra extra = {};
-    VisionBuf *buf = vipc_client.recv(&extra);
-    if (buf == nullptr) continue;
-    // TODO: path planner timeout?
-    sm.update(0);
-    int desire = ((int)sm["lateralPlan"].getLateralPlan().getDesire());
-    frame_id = sm["roadCameraState"].getRoadCameraState().getFrameId();
-    if (sm.updated("liveCalibration")) {
-      model_transform = update_calibration(sm["liveCalibration"].getLiveCalibration(), wide_camera);
-      live_calib_seen = true;
-    }
-
-    float vec_desire[DESIRE_LEN] = {0};
-    if (desire >= 0 && desire < DESIRE_LEN) {
-      vec_desire[desire] = 1.0;
-    }
-
-    double mt1 = millis_since_boot();
-    ModelOutput *model_output = model_eval_frame(&model, buf->buf_cl, buf->width, buf->height,
-                                              model_transform, vec_desire);
-    extra_model_output = model_output;
-    double mt2 = millis_since_boot();
-    float model_execution_time = (mt2 - mt1) / 1000.0;
-
-    // tracked dropped frames
-    uint32_t vipc_dropped_frames = extra.frame_id - last_vipc_frame_id - 1;
-    float frames_dropped = frame_dropped_filter.update((float)std::min(vipc_dropped_frames, 10U));
-    if (run_count < 10) { // let frame drops warm up
-      frame_dropped_filter.reset(0);
-      frames_dropped = 0.;
-    }
-    run_count++;
-
-    float frame_drop_ratio = frames_dropped / (1 + frames_dropped);
-
-    //  model_publish(pm, extra.frame_id, frame_id, frame_drop_ratio, *model_output, extra.timestamp_eof, model_execution_time,
-    //                kj::ArrayPtr<const float>(model.output.data(), model.output.size()), live_calib_seen);
-    //  posenet_publish(pm, extra.frame_id, vipc_dropped_frames, *model_output, extra.timestamp_eof, live_calib_seen);
-
-    #ifdef DROPED_FRAME_OUT_LOG
-        fprintf(extra_log_fd, "model process: %.2fms, from last %.2fms, vipc_frame_id %u, frame_id, %u, frame_drop %.3f\n", \
-                          mt2 - mt1, mt1 - last, extra.frame_id, frame_id, frame_drop_ratio);
-    #endif
-
-    last = mt1;
-    last_vipc_frame_id = extra.frame_id;
-  }while (!do_exit) ;//while (!do_exit) 
-
-  #ifdef DROPED_FRAME_OUT_LOG
-    fclose(extra_log_fd);
-  #endif
-}
-
-
 
 
 int main(int argc, char **argv)
@@ -231,28 +256,37 @@ int main(int argc, char **argv)
   /***** cl init****/
   cl_device_id device_id = cl_get_device_id(CL_DEVICE_TYPE_DEFAULT);
   cl_context context = CL_CHECK_ERR(clCreateContext(NULL, 1, &device_id, NULL, NULL, &err));
-  cl_device_id device_id_extra = cl_get_device_id(CL_DEVICE_TYPE_DEFAULT);
-  cl_context context_extra = CL_CHECK_ERR(clCreateContext(NULL, 1, &device_id_extra, NULL, NULL, &err));
-
 
   /***** init the models****/
   ModelState model;
   ModelState model_extra;
+
+  // two model init process need about 310ms
+  model_init_extra(&model_extra, device_id, context);
   model_init(&model, device_id, context);
-  model_init_extra(&model_extra, device_id_extra, context_extra);
 
-  LOGW("Two models loaded, modeld starting");
+  origin_best_plan_fd = fopen(origin_best_plan_path,"w");
+  if(origin_best_plan_fd == NULL)
+  {
+      std::cout << "can't open origin_plan_log.txt" << std::endl;
+  }
+  extra_best_plan_fd = fopen(extra_best_plan_path,"w");
+  if(extra_best_plan_fd == NULL)
+  {
+      std::cout << "can't open origin_plan_log.txt" << std::endl;
+  }
 
+   //delay 400ms,wait for two process  running
+  usleep(1000 * 400);
+  LOGW("Two models process started, modeld starting");
+ 
   VisionIpcClient vipc_client = VisionIpcClient("camerad",\
                     wide_camera ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD, true, device_id, context);
-  VisionIpcClient vipc_client_extra = VisionIpcClient("camerad", \
-                    wide_camera ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD, true, device_id_extra, context_extra);
+
   while (!do_exit && !vipc_client.connect(false)) {
     util::sleep_for(100);
   }
-  while (!do_exit && !vipc_client_extra.connect(false)) {
-    util::sleep_for(100);
-  }
+
   /****** run the models*****/
   // vipc_client.connected is false only when do_exit is true
   if (vipc_client.connected) {
@@ -260,65 +294,25 @@ int main(int argc, char **argv)
     LOGW("connected with buffer size: %d (%d x %d)", b->len, b->width, b->height);
    
     std::vector<std::thread> threads;
-    threads.push_back(std::thread(run_model_extra,std::ref(model_extra),std::ref(vipc_client_extra),wide_camera));
+    threads.push_back(std::thread(run_model_extra,std::ref(model_extra),std::ref(vipc_client),wide_camera));
+    //ensure that old model runs later than the new
+    usleep(1000 * 300);
     threads.push_back(std::thread(run_model,std::ref(model),std::ref(vipc_client),wide_camera));
 
     for(auto& t : threads)
     {
         t.join();
     }
-    
-
-      // run_model_extra(model_extra, vipc_client_extra, wide_camera);
-      // run_model(model, vipc_client, wide_camera);
   
-
-
+    
   }
 
+  fclose(origin_best_plan_fd);
+  fclose(extra_best_plan_fd);
   /*******free model*********/
   model_free(&model);
   CL_CHECK(clReleaseContext(context));
   model_free(&model_extra);
-  CL_CHECK(clReleaseContext(context_extra));
   
-  return 0;
-}
-
-int main_origin(int argc, char **argv) {
-  if (!Hardware::PC()) {
-    int ret;
-    ret = util::set_realtime_priority(54);
-    assert(ret == 0);
-    util::set_core_affinity({Hardware::EON() ? 2 : 7});
-    assert(ret == 0);
-  }
-
-  bool wide_camera = Hardware::TICI() ? Params().getBool("EnableWideCamera") : false;
-
-  // cl init
-  cl_device_id device_id = cl_get_device_id(CL_DEVICE_TYPE_DEFAULT);
-  cl_context context = CL_CHECK_ERR(clCreateContext(NULL, 1, &device_id, NULL, NULL, &err));
-
-  // init the models
-  ModelState model;
-  model_init(&model, device_id, context);
-  LOGW("models loaded, modeld starting");
-
-  VisionIpcClient vipc_client = VisionIpcClient("camerad", wide_camera ? VISION_STREAM_WIDE_ROAD : VISION_STREAM_ROAD, true, device_id, context);
-  while (!do_exit && !vipc_client.connect(false)) {
-    util::sleep_for(100);
-  }
-
-  // run the models
-  // vipc_client.connected is false only when do_exit is true
-  if (vipc_client.connected) {
-    const VisionBuf *b = &vipc_client.buffers[0];
-    LOGW("connected with buffer size: %d (%d x %d)", b->len, b->width, b->height);
-    run_model(model, vipc_client, wide_camera);
-  }
-
-  model_free(&model);
-  CL_CHECK(clReleaseContext(context));
   return 0;
 }

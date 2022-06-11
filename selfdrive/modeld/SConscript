@@ -27,11 +27,15 @@ thneed_src = [
 ]
 
 use_thneed = not GetOption('no_thneed')
-
+use_thneed = 0
 if arch == "aarch64" or arch == "larch64":
   libs += ['gsl', 'CB']
   libs += ['gnustl_shared'] if arch == "aarch64" else ['pthread', 'dl']
 
+  common_src += ['runners/onnxmodel.cc']
+  # tell runners to use onnx
+  lenv['CFLAGS'].append("-DUSE_ONNX_MODEL")
+  lenv['CXXFLAGS'].append("-DUSE_ONNX_MODEL")
   if use_thneed:
     common_src += thneed_src
     dlsym_offset = get_dlsym_offset()

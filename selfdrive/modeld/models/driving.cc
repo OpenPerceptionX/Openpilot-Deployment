@@ -1,5 +1,5 @@
 #include "selfdrive/modeld/models/driving.h"
-
+#include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -16,11 +16,14 @@ constexpr float FCW_THRESHOLD_5MS2_HIGH = 0.15;
 constexpr float FCW_THRESHOLD_5MS2_LOW = 0.05;
 constexpr float FCW_THRESHOLD_3MS2 = 0.7;
 
+constexpr int PLAN_MPH_GROUP_SIZE = PLAN_MHP_N * (1 + 2 * 33 * (5 *3));
 std::array<float, 5> prev_brake_5ms2_probs = {0,0,0,0,0};
 std::array<float, 3> prev_brake_3ms2_probs = {0,0,0};
 
-extern ModelOutput *extra_model_output;
-// #define DUMP_YUV
+extern std::mutex plan_mutex;
+extern ModelOutput* model_output_extra;
+extern FILE* origin_best_plan_fd;
+extern FILE* extra_best_plan_fd;
 
 template<class T, size_t size>
 constexpr const kj::ArrayPtr<const T> to_kj_array_ptr(const std::array<T, size> &arr) {
@@ -98,6 +101,30 @@ ModelOutput* model_eval_frame(ModelState* s, cl_mem yuv_cl, int width, int heigh
   return (ModelOutput*)&s->output;
 }
 
+ModelOutput* model_eval_frame_extra(ModelState* s, cl_mem yuv_cl, int width, int height,
+                           const mat3 &transform, float *desire_in) {
+#ifdef DESIRE
+  if (desire_in != NULL) {
+    for (int i = 1; i < DESIRE_LEN; i++) {
+      // Model decides when action is completed
+      // so desire input is just a pulse triggered on rising edge
+      if (desire_in[i] - s->prev_desire[i] > .99) {
+        s->pulse_desire[i] = desire_in[i];
+      } else {
+        s->pulse_desire[i] = 0.0;
+      }
+      s->prev_desire[i] = desire_in[i];
+    }
+  }
+#endif
+
+  // if getInputBuf is not NULL, net_input_buf will be
+  auto net_input_buf = s->frame->prepare(yuv_cl, width, height, transform, static_cast<cl_mem*>(s->m->getInputBuf()));
+  s->m->execute(net_input_buf, s->frame->buf_size);
+
+  return (ModelOutput*)&s->output;
+}
+
 void model_free(ModelState* s) {
   delete s->frame;
 }
@@ -126,7 +153,7 @@ void fill_lead(cereal::ModelDataV2::LeadDataV3::Builder lead, const ModelOutputL
   lead.setA(to_kj_array_ptr(lead_a));
   lead.setXStd(to_kj_array_ptr(lead_x_std));
   lead.setYStd(to_kj_array_ptr(lead_y_std));
-  lead.setVStd(to_kj_array_ptr(lead_v_std));
+  lead.setVStd(to_kj_array_ptr(lead_v_std));    
   lead.setAStd(to_kj_array_ptr(lead_a_std));
 }
 
@@ -223,21 +250,7 @@ void fill_plan(cereal::ModelDataV2::Builder &framed, const ModelOutputPlanPredic
     rot_rate_x[i] = plan.mean[i].rotation_rate.x;
     rot_rate_y[i] = plan.mean[i].rotation_rate.y;
     rot_rate_z[i] = plan.mean[i].rotation_rate.z;
-    // pos_x[i] = 0;
-    // pos_y[i] = 0;
-    // pos_z[i] = 0;
-    // pos_x_std[i] = 0;
-    // pos_y_std[i] = 0;
-    // pos_z_std[i] = 0;
-    // vel_x[i] = 0;
-    // vel_y[i] = 0;
-    // vel_z[i] = 0;
-    // rot_x[i] = 0;
-    // rot_y[i] = 0;
-    // rot_z[i] = 0;
-    // rot_rate_x[i] = 0;
-    // rot_rate_y[i] = 0;
-    // rot_rate_z[i] = 0;
+  
   }
 
   fill_xyzt(framed.initPosition(), T_IDXS_FLOAT, pos_x, pos_y, pos_z, pos_x_std, pos_y_std, pos_z_std);
@@ -306,11 +319,25 @@ void fill_road_edges(cereal::ModelDataV2::Builder &framed, const std::array<floa
 }
 
 
-void fill_model(cereal::ModelDataV2::Builder &framed, const ModelOutput &net_outputs) {
+void fill_model(cereal::ModelDataV2::Builder &framed, uint64_t timestamp_eof, const ModelOutput &net_outputs) {
 
-  // substitute onnxmodel best plan by extra model
-  const auto &best_plan = net_outputs.plans.get_best_prediction();
-  const auto &best_plan_extra = (*extra_model_output).plans.get_best_prediction();
+  const auto &best_plan_origin = net_outputs.plans.get_best_prediction();
+  struct ModelOutputPlanPrediction best_plan;
+  
+  {
+      std::lock_guard<std::mutex> plan_lock(plan_mutex);
+      best_plan = model_output_extra->plans.get_best_prediction();
+  }
+
+  // output best plan to files
+  for(int i=0; i<TRAJECTORY_SIZE; i++) {
+  fprintf(origin_best_plan_fd,"%lu,%.2f,%.2f,%.2f\n",\
+          timestamp_eof, best_plan_origin.mean[i].position.x, best_plan_origin.mean[i].position.y, \
+          best_plan_origin.mean[i].position.z);
+    fprintf(extra_best_plan_fd,"%lu,%.2f,%.2f,%.2f\n",\
+            timestamp_eof, best_plan.mean[i].position.x, best_plan.mean[i].position.y, \
+            best_plan.mean[i].position.z);
+  }
 
   std::array<float, TRAJECTORY_SIZE> plan_t;
   std::fill_n(plan_t.data(), plan_t.size(), NAN);
@@ -332,7 +359,6 @@ void fill_model(cereal::ModelDataV2::Builder &framed, const ModelOutput &net_out
     float p = (X_IDXS[xidx] - current_x_val) / (next_x_val - current_x_val);
     plan_t[xidx] = p * T_IDXS[tidx+1] + (1 - p) * T_IDXS[tidx];
   }
-
 
   fill_plan(framed, best_plan);
   fill_lane_lines(framed, plan_t, net_outputs.lane_lines);
@@ -363,8 +389,10 @@ void model_publish(PubMaster &pm, uint32_t vipc_frame_id, uint32_t frame_id, flo
   if (send_raw_pred) {
     framed.setRawPredictions(raw_pred.asBytes());
   }
-  fill_model(framed, net_outputs);
+  fill_model(framed, timestamp_eof, net_outputs);
+
   pm.send("modelV2", msg);
+
 }
 
 void posenet_publish(PubMaster &pm, uint32_t vipc_frame_id, uint32_t vipc_dropped_frames,
