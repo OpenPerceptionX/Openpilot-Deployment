@@ -1,2 +1,2 @@
-# openpilot_with_two_models
-openpilot test program by running two onnxmodel on PC
+# Openpilot-Deployment
+This repo is tested dual-model deployment solution on CommaTwo device.
